@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "TerminalX Web Edition",
+  "version": "1.1.0",
+  "description": "A modern, premium developer tool for web scripting with a Terminal X aesthetic.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "icons": {
+    "128": "icon.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}
