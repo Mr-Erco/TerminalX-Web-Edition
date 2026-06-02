@@ -10,7 +10,7 @@ Terminal output for logs and debugging
 
 Clean, dark, Terminal X–themed interface
 
-📦 Installation (Developer Mode)
+ Installation (Developer Mode)
 
 Download the Extension Download the project as a ZIP or clone the repo:
 git clone https://github.com/YOUR-USERNAME/TerminalX-Web-Extension.git 2. Open Chrome Extensions Go to:
@@ -22,7 +22,7 @@ Select the folder you downloaded.
 
 Done The Terminal X icon will appear in your Chrome toolbar.
 
-🚀 Usage Click the Terminal X icon
+ Usage Click the Terminal X icon
 
 Create or open a script
 
