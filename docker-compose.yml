@@ -1,0 +1,1365 @@
+# =============================================================================
+# RedAmon - Unified Docker Compose
+# =============================================================================
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+# Build:  docker compose --profile tools build
+# GVM:    Starts automatically with `docker compose up -d`
+#         (first run takes ~10-15 min for feed sync)
+#         Credentials: gvmd auto-creates admin/admin, then `redamon.sh install
+#         --gvm` rotates it to a strong GVM_PASSWORD (pinned in .env) that the app
+#         also uses. Both sides read GVM_PASSWORD, so keep them in sync.
+#         Change password: docker compose exec -u gvmd gvmd gvmd --user=admin --new-password='<password>'
+#         (then set the same value as GVM_PASSWORD in .env and recreate recon-orchestrator)
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # Databases
+  # ===========================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: redamon-postgres
+    mem_limit: ${POSTGRES_MEM:-1g}          # sized from host RAM by redamon.sh
+    pids_limit: ${POSTGRES_PIDS:-512}       # D1: fork-bomb ceiling (generous)
+    cpus: ${POSTGRES_CPUS:-4}               # D1: CPU cap (generous; host has more)
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-redamon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set - run redamon.sh (STRIDE S13)}
+      POSTGRES_DB: ${POSTGRES_DB:-redamon}
+    ports:
+      # Loopback-only: app tier reaches Postgres over the internal `redamon`
+      # bridge (postgres:5432); host publish is debug-only. Prevents LAN/remote
+      # reach to a default-credentialed DB (STRIDE S13). Override via .env if you
+      # genuinely need host access (e.g. POSTGRES_PORT=0.0.0.0:5432 is NOT valid;
+      # instead drop the 127.0.0.1 prefix intentionally).
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-redamon} -d ${POSTGRES_DB:-redamon}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - redamon
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: redamon-neo4j
+    # Memory governor (Part 4): container hard cap MUST exceed heap + pagecache or
+    # the JVM is OOM-killed. redamon.sh export_resource_caps sizes these to the
+    # host; the defaults keep heap+pagecache (3G) well inside the 4.5G limit.
+    mem_limit: ${NEO4J_MEM:-4608m}
+    pids_limit: ${NEO4J_PIDS:-1024}         # D1: fork-bomb ceiling (generous)
+    cpus: ${NEO4J_CPUS:-8}                   # D1: CPU cap (generous)
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set - run redamon.sh (STRIDE S13)}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_security_procedures_allowlist: apoc.*
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2g}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1g}
+    ports:
+      # Loopback-only: the agent/webapp reach Neo4j over the internal `redamon`
+      # bridge (neo4j:7687); host publish is debug-only. Prevents LAN/remote reach
+      # to a default-credentialed graph DB (STRIDE S13).
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - redamon
+      # Also on the orchestrator's isolated net so the clean half of the
+      # TruffleHog split can write the graph. Narrower than putting the
+      # privileged orchestrator on redamon-network: only Neo4j becomes
+      # reachable, and nothing new can reach the orchestrator's :8010.
+      - orchestrator-net
+
+  # ===========================================================================
+  # GVM / OpenVAS — Vulnerability Scanner Stack
+  # Starts automatically with the rest of the stack
+  # ===========================================================================
+
+  # --- Data containers (init-only, exit after populating volumes) ---
+  # They restart on failure because gvm-ospd is gated on them via
+  # service_completed_successfully: one SIGKILL (a host OOM, a stop landing
+  # mid-copy) otherwise leaves the scanner never created, and gvmd then accepts
+  # scan tasks that nothing will ever run (issue #174).
+
+  gvm-vt:
+    image: registry.community.greenbone.net/community/vulnerability-tests
+    container_name: redamon-gvm-vt
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    environment:
+      FEED_RELEASE: "24.10"
+    volumes:
+      - vt_data:/mnt
+
+  gvm-notus-data:
+    image: registry.community.greenbone.net/community/notus-data
+    container_name: redamon-gvm-notus-data
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    volumes:
+      - notus_data:/mnt
+
+  gvm-scap-data:
+    image: registry.community.greenbone.net/community/scap-data
+    container_name: redamon-gvm-scap-data
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    volumes:
+      - scap_data:/mnt
+
+  gvm-cert-bund-data:
+    image: registry.community.greenbone.net/community/cert-bund-data
+    container_name: redamon-gvm-cert-data
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    volumes:
+      - cert_data:/mnt
+
+  gvm-dfn-cert-data:
+    image: registry.community.greenbone.net/community/dfn-cert-data
+    container_name: redamon-gvm-dfn-cert
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    volumes:
+      - cert_data:/mnt
+    depends_on:
+      - gvm-cert-bund-data
+
+  gvm-data-objects:
+    image: registry.community.greenbone.net/community/data-objects
+    container_name: redamon-gvm-data-objects
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    environment:
+      FEED_RELEASE: "24.10"
+    volumes:
+      - data_objects:/mnt
+
+  gvm-report-formats:
+    image: registry.community.greenbone.net/community/report-formats
+    container_name: redamon-gvm-report-formats
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    environment:
+      FEED_RELEASE: "24.10"
+    volumes:
+      - data_objects:/mnt
+    depends_on:
+      - gvm-data-objects
+
+  gvm-gpg-data:
+    image: registry.community.greenbone.net/community/gpg-data
+    container_name: redamon-gvm-gpg-data
+    mem_limit: ${GVM_DATA_MEM:-1g}    # shared cap for the one-shot feed loaders (they start concurrently)
+    restart: on-failure:5
+    volumes:
+      - gpg_data:/mnt
+
+  # --- GVM runtime services ---
+
+  gvm-redis:
+    image: registry.community.greenbone.net/community/redis-server:stable
+    container_name: redamon-gvm-redis
+    mem_limit: ${GVM_REDIS_MEM:-1g}   # sized from host RAM by redamon.sh (holds the whole VT feed; routinely multi-GB)
+    restart: on-failure
+    volumes:
+      - gvm_redis_socket:/run/redis/
+
+  gvm-postgres:
+    image: registry.community.greenbone.net/community/pg-gvm:stable
+    container_name: redamon-gvm-postgres
+    mem_limit: ${GVM_POSTGRES_MEM:-1g}   # sized from host RAM by redamon.sh (GVM's own database)
+    restart: on-failure
+    # The stale-lock cleanup runs INSIDE this container, right before postgres
+    # starts. It used to be a sibling one-shot sharing the socket volume, which
+    # deleted the LIVE socket on every repeat `up`: compose leaves an already-
+    # running service alone but still re-runs an exited one-shot, so gvmd lost
+    # its database and crash-looped while postgres still reported healthy (#174).
+    # Cleaning from inside is race-free by construction - nothing here is serving
+    # yet. The image's own entrypoint runs as root and ends in `exec gosu
+    # postgres "$@"`, so it is re-entered with its default command unchanged.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        rm -f /var/run/postgresql/.s.PGSQL.5432 \
+              /var/run/postgresql/.s.PGSQL.5432.lock \
+              /var/lib/postgresql/*/main/postmaster.pid
+        exec /usr/local/bin/entrypoint /usr/local/bin/start-postgresql
+    volumes:
+      - gvm_psql_data:/var/lib/postgresql
+      - gvm_psql_socket:/var/run/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h /var/run/postgresql"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  gvmd:
+    image: registry.community.greenbone.net/community/gvmd:stable
+    container_name: redamon-gvm-gvmd
+    mem_limit: ${GVMD_MEM:-3g}              # sized from host RAM by redamon.sh (gvm profile)
+    restart: on-failure
+    volumes:
+      - gvmd_data:/var/lib/gvm
+      - scap_data:/var/lib/gvm/scap-data/
+      - cert_data:/var/lib/gvm/cert-data
+      - data_objects:/var/lib/gvm/data-objects/gvmd
+      - vt_data:/var/lib/openvas/plugins
+      - gvm_psql_data:/var/lib/postgresql
+      - gvmd_socket:/run/gvmd
+      - ospd_socket:/run/ospd
+      - gvm_psql_socket:/var/run/postgresql
+    depends_on:
+      gvm-postgres:
+        condition: service_healthy
+      gvm-scap-data:
+        condition: service_completed_successfully
+      gvm-cert-bund-data:
+        condition: service_completed_successfully
+      gvm-dfn-cert-data:
+        condition: service_completed_successfully
+      gvm-data-objects:
+        condition: service_completed_successfully
+      gvm-report-formats:
+        condition: service_completed_successfully
+
+  gvm-ospd:
+    image: registry.community.greenbone.net/community/ospd-openvas:stable
+    container_name: redamon-gvm-ospd
+    mem_limit: ${GVM_OSPD_MEM:-2g}   # sized from host RAM by redamon.sh (the actual OpenVAS scanner: heaviest of the stack)
+    restart: on-failure
+    hostname: ospd-openvas.local
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    command:
+      [
+        "ospd-openvas",
+        "-f",
+        "--config",
+        "/etc/gvm/ospd-openvas.conf",
+        "--notus-feed-dir",
+        "/var/lib/notus/advisories",
+        "-m",
+        "666",
+      ]
+    volumes:
+      - gpg_data:/etc/openvas/gnupg
+      - vt_data:/var/lib/openvas/plugins
+      - notus_data:/var/lib/notus
+      - ospd_socket:/run/ospd
+      - gvm_redis_socket:/run/redis/
+    depends_on:
+      gvm-redis:
+        condition: service_started
+      gvm-gpg-data:
+        condition: service_completed_successfully
+      gvm-vt:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # Recon Scanner Image (build only — not a running service)
+  # Build with: docker compose --profile tools build
+  # ===========================================================================
+
+  recon:
+    build:
+      context: .
+      dockerfile: recon/Dockerfile
+      network: host
+    image: redamon-recon:latest
+    profiles: ["tools"]
+
+  vuln-scanner:
+    build:
+      context: .
+      dockerfile: scanners/gvm_scan/Dockerfile
+    image: redamon-vuln-scanner:latest
+    profiles: ["tools"]
+
+  github-secret-hunter:
+    build:
+      context: .
+      dockerfile: scanners/github_secret_hunt/Dockerfile
+    image: redamon-github-hunter:latest
+    profiles: ["tools"]
+
+  trufflehog-scanner:
+    build:
+      context: .
+      dockerfile: scanners/trufflehog_scan/Dockerfile
+    image: redamon-trufflehog:latest
+    profiles: ["tools"]
+
+  # WCVS (Web Cache Vulnerability Scanner) — breadth engine for the cache
+  # poisoning module. Build-only: the recon container runs it docker-in-docker.
+  # See recon/cache_scan/ and wcvs/Dockerfile.
+  wcvs:
+    build:
+      context: ./scanners/wcvs
+      dockerfile: Dockerfile
+    image: redamon-wcvs:latest
+    profiles: ["tools"]
+
+  # CodeFix build sandbox: runs the UNTRUSTED clone+build+test step of the
+  # CypherFix agent in isolation (threats T6/E10). Spawned ephemerally per job by
+  # recon_orchestrator/container_manager.py with no secrets, cap_drop=ALL,
+  # no-new-privileges, read-only rootfs, resource limits, on codefix-net (no
+  # RedAmon peer). Build-only here; never run as a long-lived compose service.
+  codefix-sandbox:
+    build:
+      context: .
+      dockerfile: scanners/codefix_sandbox/Dockerfile
+    image: redamon-codefix-sandbox:latest
+    profiles: ["tools"]
+
+  # Supply-chain DIRTY analyzer (plan Phase 0.5): the secret-free box that
+  # processes untrusted supply-chain input (tarballs, target JS, manifests).
+  # Build-only (spawned per-job by the orchestrator, hardened, network-isolated).
+  supply-chain-analyzer:
+    build:
+      context: .
+      dockerfile: scanners/supply_chain_analyzer/Dockerfile
+    image: redamon-supply-chain-analyzer:latest
+    profiles: ["tools"]
+
+  # Supply-Chain scan (L1 "Other Scans") CLEAN writer. Build-only; spawned per
+  # scan by the orchestrator (holds Neo4j creds, static offline osv pass).
+  supply-chain:
+    build:
+      context: .
+      dockerfile: scanners/supply_chain_scan/Dockerfile
+    image: redamon-supply-chain:latest
+    profiles: ["tools"]
+
+  # BadDNS (AGPL-3.0) runs isolated in its own container. RedAmon never
+  # imports or links against it -- the recon container spawns this image
+  # via Docker-in-Docker and receives NDJSON on stdout. See baddns_scan/
+  # Dockerfile and THIRD-PARTY-LICENSES.md for the license boundary.
+  baddns-scanner:
+    build:
+      context: .
+      dockerfile: scanners/baddns_scan/Dockerfile
+    image: redamon-baddns:latest
+    profiles: ["tools"]
+
+  # AI Attack Surface — deterministic offensive testing of the discovered AI
+  # surface. Built but never run directly; spawned on demand by the
+  # recon-orchestrator (Step 3), like the other tool scanners.
+  ai-attack-surface:
+    build:
+      context: .
+      dockerfile: scanners/ai_attack_surface_scan/Dockerfile
+    image: redamon-ai-attack-surface:latest
+    profiles: ["tools"]
+
+  # ===========================================================================
+  # Backend Services
+  # ===========================================================================
+
+  # V4: filtering broker for the Docker socket. The recon / partial-recon
+  # containers mount the broker's RESTRICTED socket instead of the raw
+  # /var/run/docker.sock, so a compromised recon container cannot escape to the
+  # host (no -v /:/host, no --privileged, no non-allowlisted image). The broker
+  # holds the REAL socket (it is trusted, like the orchestrator) and serves its
+  # filtered socket on the redamon_broker_socket named volume (which lives inside
+  # the Linux VM, so the unix socket is shareable on macOS + Linux). See
+  # services/docker_broker/.
+  docker-broker:
+    build: ./services/docker_broker
+    image: redamon-docker-broker:latest
+    container_name: redamon-docker-broker
+    restart: unless-stopped
+    mem_limit: ${DOCKER_BROKER_MEM:-512m}   # sized from host RAM by redamon.sh
+    pids_limit: ${DOCKER_BROKER_PIDS:-256}  # D1: fork-bomb ceiling
+    cpus: ${DOCKER_BROKER_CPUS:-2}          # D1: CPU cap (generous)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock          # real socket (forward target)
+      - redamon_broker_socket:/var/run/broker              # named volume; lives in the Linux VM so the unix socket is shareable on macOS + Linux
+      - /tmp/redamon:/tmp/redamon                           # shared scratch dir (recon output, temp files)
+    environment:
+      DOCKER_BROKER_UPSTREAM: /var/run/docker.sock
+      DOCKER_BROKER_LISTEN: /var/run/broker/docker.sock
+      # Tool images the recon pipeline may run (V3 set is the broker default;
+      # operator extras flow through to keep parity with RECON_EXTRA_ALLOWED_IMAGES).
+      DOCKER_BROKER_ALLOWED_IMAGES: ${RECON_EXTRA_ALLOWED_IMAGES:-}
+      # Host bind sources the tools legitimately mount: the shared scratch dir and
+      # anything under the repo root (recon output, wordlists, custom templates).
+      # Everything else (/, /etc, /root, the docker socket) is denied.
+      DOCKER_BROKER_ALLOWED_BIND_PREFIXES: /tmp/redamon,${PWD:-/home/samuele/Progetti didattici/redamon}
+      DOCKER_BROKER_ALLOWED_VOLUMES: nuclei-templates
+      # Memory governor (Part 4d): hard memory cap injected into every sibling
+      # tool container (katana/nuclei/httpx/...). Default ~2g; PIDS 0 = unset.
+      BROKER_TOOL_MEM_BYTES: ${BROKER_TOOL_MEM_BYTES:-2g}
+      # D1: fork-bomb ceiling injected into every sibling tool container
+      # (katana/nuclei/httpx/...). Was 0 (unlimited); 512 is generous per tool.
+      BROKER_TOOL_PIDS: ${BROKER_TOOL_PIDS:-512}
+      # Phase 7: cap the NUMBER of concurrently-running broker-owned containers the
+      # memory governor cannot see. Generous backstop; 0 disables. Raise if legit
+      # parallel scans (each spawns a dozen tools) hit it.
+      BROKER_MAX_CONTAINERS: ${BROKER_MAX_CONTAINERS:-48}
+      # T1/T2: extra host prefixes a tool bind may mount READ-WRITE. Empty passes
+      # through so broker.py keeps its restrictive default (["/tmp/redamon"] only);
+      # every other source-tree bind is forced :ro. Wired here (broker has no
+      # env_file) so setting it in .env actually reaches the broker.
+      DOCKER_BROKER_ALLOWED_RW_PREFIXES: ${DOCKER_BROKER_ALLOWED_RW_PREFIXES:-}
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /var/run/broker/docker.sock"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  recon-orchestrator:
+    build: ./recon_orchestrator
+    container_name: redamon-recon-orchestrator
+    mem_limit: ${RECON_ORCHESTRATOR_MEM:-1g}   # sized from host RAM by redamon.sh
+    pids_limit: ${RECON_ORCHESTRATOR_PIDS:-512}  # D1: fork-bomb ceiling
+    cpus: ${RECON_ORCHESTRATOR_CPUS:-4}          # D1: CPU cap (generous)
+    ports:
+      # V1 isolation: bind to host loopback only. Reachable from the host (debug)
+      # but NOT from bridge containers via the gateway IP (closes the back door).
+      - "127.0.0.1:${RECON_ORCH_PORT:-8010}:8010"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./recon_orchestrator:/app
+      - ./recon:/app/recon:ro
+      - ./recon/output:/app/recon/output:rw
+      # graph_db source, mounted ONLY so its host path is auto-detectable. The
+      # orchestrator binds graph_db into every spawned scan container; before this
+      # it DERIVED that host path by string surgery on a sibling source path
+      # (sibling_host_path(recon_path, "graph_db")). That guess is wrong wherever
+      # Docker reports a rewritten bind Source (Docker Desktop on Windows/WSL2),
+      # Docker then silently AUTO-CREATES the missing directory, and the empty dir
+      # shadows the good copy baked into the scan image, and every spawned scan dies
+      # with "cannot import name 'Neo4jClient' from 'graph_db' (unknown location)".
+      # With this mount the path is read from Docker's own mount table instead.
+      - ./graph_db:/app/graph_db:ro
+      - ./scanners/gvm_scan:/app/gvm_scan:ro
+      - ./scanners/gvm_scan/output:/app/gvm_scan/output:rw
+      - ./scanners/github_secret_hunt:/app/github_secret_hunt:ro
+      - ./scanners/github_secret_hunt/output:/app/github_secret_hunt/output:rw
+      - ./scanners/trufflehog_scan:/app/trufflehog_scan:ro
+      # The only directory a TruffleHog scan container may read from disk.
+      # Mounted here so the orchestrator can resolve its HOST path from its
+      # own mounts rather than deriving it (a bind source Docker cannot find
+      # is not an error - it is silently an empty directory).
+      - ./scanners/scan_targets:/app/scan_targets:ro
+      - ./scanners/trufflehog_scan/output:/app/trufflehog_scan/output:rw
+      # Supply-Chain scan (L1): source mounted so the orchestrator can resolve
+      # SUPPLY_CHAIN_PATH (host-path detection) and bind it into the spawned scan.
+      - ./scanners/supply_chain_scan:/app/supply_chain_scan:ro
+      - ./scanners/supply_chain_scan/output:/app/supply_chain_scan/output:rw
+      - ./scanners/ai_attack_surface_scan:/app/ai_attack_surface_scan:ro
+      - ./mcp/nuclei-templates:/app/nuclei-templates:ro
+      - /tmp/redamon:/tmp/redamon:rw
+      # Shared with the agent: the orchestrator resolves this volume's host path
+      # (via mount auto-detection) to bind per-job worktrees into the CodeFix build
+      # sandbox it spawns (T6/E10).
+      - cypherfix-work:/app/codefix-work
+      # DB -> file reconciler: the orchestrator materialises the global TrafficMind
+      # capture config (source of truth = DB) into this shared volume so the
+      # credential-free proxy can hot-reload it. Same volume the proxy mounts at /spool.
+      - capture_spool:/spool
+    environment:
+      # Host paths are auto-detected from container mounts (no hardcoded paths needed)
+      RECON_IMAGE: redamon-recon:latest
+      GVM_IMAGE: redamon-vuln-scanner:latest
+      GITHUB_HUNT_IMAGE: redamon-github-hunter:latest
+      TRUFFLEHOG_IMAGE: redamon-trufflehog:latest
+      AI_ATTACK_SURFACE_IMAGE: redamon-ai-attack-surface:latest
+      # CodeFix build sandbox image + the docker network it attaches to (T6/E10).
+      CODEFIX_SANDBOX_IMAGE: redamon-codefix-sandbox:latest
+      CODEFIX_SANDBOX_NETWORK: redamon-codefix-net
+      # Auth (forwarded to spawned containers)
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-changeme}
+      SCANNER_API_KEY: ${SCANNER_API_KEY:-changeme}  # S3/E6 scoped scanner token
+      # Optional operator pin for the GVM stall watchdog (seconds; default 1800,
+      # 0 disables). The orchestrator has NO env_file, so a value in .env is inert
+      # unless it is named here, and it is forwarded to the scan container only
+      # when actually set.
+      GVM_NO_PROGRESS_TIMEOUT: ${GVM_NO_PROGRESS_TIMEOUT:-}
+      # Inbound API auth: the orchestrator validates this on every request (except
+      # /health). Shared ONLY with the webapp — deliberately NOT forwarded to the
+      # spawned recon/scan containers, so a compromised recon container (which does
+      # hold INTERNAL_API_KEY) still cannot drive the orchestration API.
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:-changeme}
+      # HTTP traffic capture (Phase 1): the orchestrator spawns/stops the proxy +
+      # ingest pair on the toggle. It passes the scoped INSERT-only DSN to the
+      # ingest (role created once via capture_proxy/sql/001). The proxy stays
+      # credential-free; the orchestrator never puts DB creds on it.
+      TRAFFIC_INGEST_DATABASE_URL: ${TRAFFIC_INGEST_DATABASE_URL:-}
+      CAPTURE_PROXY_IMAGE: ${CAPTURE_PROXY_IMAGE:-redamon-capture-proxy:latest}
+      CAPTURE_PROXY_PORT: ${CAPTURE_PROXY_PORT:-8888}
+      CAPTURE_PROXY_MAX_BODY_KB: ${CAPTURE_PROXY_MAX_BODY_KB:-64}
+      CAPTURE_PROXY_STORE_BODIES: ${CAPTURE_PROXY_STORE_BODIES:-true}
+      CAPTURE_STORE_REQ_BODIES: ${CAPTURE_STORE_REQ_BODIES:-true}
+      CAPTURE_STORE_RESP_BODIES: ${CAPTURE_STORE_RESP_BODIES:-true}
+      CAPTURE_MAX_STORE_MB: ${CAPTURE_MAX_STORE_MB:-5}
+      CAPTURE_BODY_RULES: ${CAPTURE_BODY_RULES:-}
+      CAPTURE_PROXY_REDACT_SECRETS: ${CAPTURE_PROXY_REDACT_SECRETS:-true}
+      CAPTURE_BLOCKED_IPS: ${CAPTURE_BLOCKED_IPS:-}
+      # The orchestrator's OWN trusted webapp URL for credentialed pre-flight
+      # calls (RoE / hard-guardrail). Reachable by DNS now that V1 put the
+      # orchestrator on a shared net with the webapp. NOT the client-supplied
+      # localhost:3000 (that is for host-network spawned scan containers).
+      WEBAPP_API_URL: http://webapp:3000
+      # V2: webapp URL forwarded to *spawned* scan containers. They run on the
+      # HOST network, so they reach the webapp via the host-published port
+      # (localhost:3000), not the `webapp` DNS name. Server-controlled, never the
+      # client-supplied request.webapp_api_url (which would be an SSRF/key-leak).
+      SPAWNED_WEBAPP_API_URL: http://localhost:3000
+      # V3: comma-separated extra tool Docker images the operator approves beyond
+      # the shipped allowlist (e.g. private-registry mirrors for air-gapped use:
+      # "myregistry.local/naabu:latest,myregistry.local/httpx:latest"). Empty =
+      # strict shipped-only. Forwarded to the recon pipeline by container_manager.
+      RECON_EXTRA_ALLOWED_IMAGES: ${RECON_EXTRA_ALLOWED_IMAGES:-}
+      # Scan Timeline — Scan Scheduler worker (plan Section 7.2). It ticks here
+      # (the orchestrator owns admission + spawn) and asks the webapp to run each
+      # due schedule through the same start path a manual scan uses. Listed
+      # explicitly because the orchestrator has NO env_file: a value set only in
+      # .env would be silently inert here.
+      SCAN_SCHEDULER_ENABLED: ${SCAN_SCHEDULER_ENABLED:-true}
+      SCAN_SCHEDULER_TICK_SECONDS: ${SCAN_SCHEDULER_TICK_SECONDS:-60}
+      # Scan Queue dispatcher (Phase 2). The orchestrator has no env_file, so these
+      # are inert unless listed here. MAX_CONCURRENT is the REAL ceiling (the
+      # ledger count cap is None when RECON_MAX_CONCURRENT_GLOBAL is unset).
+      JOB_QUEUE_DISPATCHER_ENABLED: ${JOB_QUEUE_DISPATCHER_ENABLED:-true}
+      JOB_QUEUE_TICK_SECONDS: ${JOB_QUEUE_TICK_SECONDS:-20}
+      JOB_QUEUE_MAX_CONCURRENT: ${JOB_QUEUE_MAX_CONCURRENT:-4}
+      JOB_QUEUE_MIN_FREE_DISK: ${JOB_QUEUE_MIN_FREE_DISK:-10737418240}
+      TRAFFIC_MAINTENANCE_INTERVAL: ${TRAFFIC_MAINTENANCE_INTERVAL:-3600}
+      # D3: global + per-user concurrent-scan ceilings enforced at admission.
+      # SAFE, GENEROUS DEFAULTS so unset resolves to a real limit (never "no cap").
+      RECON_MAX_CONCURRENT_GLOBAL: ${RECON_MAX_CONCURRENT_GLOBAL:-30}
+      RECON_MAX_CONCURRENT_PER_USER: ${RECON_MAX_CONCURRENT_PER_USER:-30}
+      # D1: per-spawned-container CPU + PID ceilings (resource governor). Empty
+      # passes through so container_manager.py keeps its safe code defaults
+      # (CPU_FRACTION 0.5 of host cores, PER_CONTAINER_CPUS 0 = no absolute ceiling,
+      # PIDS_MAX 512). Wired here (orchestrator has no env_file) so setting them in
+      # .env actually reaches the orchestrator instead of being silently inert.
+      CONTAINER_CPU_FRACTION: ${CONTAINER_CPU_FRACTION:-}
+      PER_CONTAINER_CPUS: ${PER_CONTAINER_CPUS:-}
+      CONTAINER_PIDS_MAX: ${CONTAINER_PIDS_MAX:-}
+      # Offline OSV database: lazy-on-scan auto-refresh (supply-chain feature).
+      # Same env_file caveat as above - wired explicitly or .env is inert. Safe
+      # defaults need no .env edit: refresh ON, npm only, 24h TTL, 15m ceiling.
+      # Set OSV_DB_AUTO_REFRESH=false for a strictly air-gapped deployment.
+      OSV_DB_AUTO_REFRESH: ${OSV_DB_AUTO_REFRESH:-true}
+      # ALL supported ecosystems by default. Only npm used to be listed, so a
+      # PyPI/Go/Maven DB an operator synced by hand was never refreshed and
+      # silently went stale - new advisories for it would never be seen.
+      # Full coverage costs ~279 MB vs ~208 MB for npm alone (measured
+      # 2026-08-07); the other seven are ~71 MB combined.
+      OSV_DB_ECOSYSTEMS: ${OSV_DB_ECOSYSTEMS:-npm,PyPI,Go,Maven,crates.io,Packagist,RubyGems,NuGet}
+      OSV_DB_TTL_SECONDS: ${OSV_DB_TTL_SECONDS:-86400}
+      OSV_DB_REFRESH_TIMEOUT: ${OSV_DB_REFRESH_TIMEOUT:-900}
+      # Supply-chain incident intel (supplychainattack.org): same lazy-on-scan
+      # auto-refresh contract as the OSV DB above, and the SAME env_file caveat -
+      # without these lines a .env entry is silently inert and the intel would
+      # never refresh. Set SCA_INTEL_AUTO_REFRESH=false for an air-gapped deploy.
+      SCA_INTEL_AUTO_REFRESH: ${SCA_INTEL_AUTO_REFRESH:-true}
+      SCA_INTEL_TTL_SECONDS: ${SCA_INTEL_TTL_SECONDS:-86400}
+      # Retry floor after a FAILED or REJECTED fetch. The envelope contract keeps
+      # the previous files on rejection, so manifest.json never advances and a
+      # TTL-only check would re-fetch on every single scan spawn while the feed
+      # stays broken.
+      SCA_INTEL_RETRY_SECONDS: ${SCA_INTEL_RETRY_SECONDS:-3600}
+      # 120s, not the OSV path's 900s: the feed is ~5 MB, so a bigger ceiling
+      # would only ever mean a hung fetch sitting on the scan-spawn path.
+      SCA_INTEL_REFRESH_TIMEOUT: ${SCA_INTEL_REFRESH_TIMEOUT:-120}
+      # Unlike the OSV DB this MAY bootstrap a cold volume on the scan path: the
+      # OSV cold guard exists only because its first download is ~208 MB.
+      SCA_INTEL_BOOTSTRAP_ON_SCAN: ${SCA_INTEL_BOOTSTRAP_ON_SCAN:-true}
+      # Supply-chain DIRTY analyzer caps. Same env_file caveat again: these are
+      # documented in .env.example and read by container_manager.py, but without
+      # these lines .env was silently inert and the knobs did nothing. ALL pass
+      # through EMPTY on purpose - an empty value means "no operator override",
+      # which hands the ceiling back to the memory governor (envelope x headroom,
+      # ~1.5 GB, shrinking on a starved host). Setting SUPPLY_CHAIN_ANALYZER_MEM
+      # pins a fixed cap and opts the container out of the governor. The
+      # orchestrator forwards whichever of these are set into every spawned
+      # recon/L1 scan container, so the second spawn implementation
+      # (supply_chain_common.analyzer_dispatch) resolves them identically.
+      SUPPLY_CHAIN_ANALYZER_MEM: ${SUPPLY_CHAIN_ANALYZER_MEM:-}
+      SUPPLY_CHAIN_ANALYZER_PIDS: ${SUPPLY_CHAIN_ANALYZER_PIDS:-}
+      SUPPLY_CHAIN_ANALYZER_NANOCPUS: ${SUPPLY_CHAIN_ANALYZER_NANOCPUS:-}
+      # Memory-governor admission knobs (scan reservation ledger). Same rationale
+      # as the D1 CPU/PID caps above: the orchestrator has NO env_file, so these
+      # are wired explicitly or setting them in .env is silently inert. All pass
+      # through empty, so unset keeps the safe code/profile defaults
+      # (resource_governor.py + resource_profile.default.json). RECON_JOB_ENVELOPE_MEM
+      # is the documented lever a small host lowers when a scan is wrongly refused
+      # for "not enough free memory" — it MUST reach the orchestrator to work.
+      REDAMON_MEM_GOVERNOR: ${REDAMON_MEM_GOVERNOR:-}
+      OS_HEADROOM_MEM: ${OS_HEADROOM_MEM:-}
+      SERVICE_BASELINE_MEM: ${SERVICE_BASELINE_MEM:-}
+      # Caps for the containers the ORCHESTRATOR spawns itself. The orchestrator
+      # has no env_file, so a var reaches it only by being listed here -- without
+      # these the allocator's values were computed, written to .env, and then
+      # ignored at spawn time: capture-proxy ran at the hardcoded 384m and
+      # traffic-ingest at 256m on a 31.7 GB host, verified live.
+      CAPTURE_PROXY_MEM: ${CAPTURE_PROXY_MEM:-}
+      TRAFFIC_INGEST_MEM: ${TRAFFIC_INGEST_MEM:-}
+      CODEFIX_SANDBOX_MEM: ${CODEFIX_SANDBOX_MEM:-}
+      RECON_JOB_ENVELOPE_MEM: ${RECON_JOB_ENVELOPE_MEM:-}
+      RESOURCE_PROFILE_PATH: ${RESOURCE_PROFILE_PATH:-}
+      RESOURCE_PROFILE_DEFAULT_PATH: ${RESOURCE_PROFILE_DEFAULT_PATH:-}
+      MEM_SAFETY_TOLERANCE: ${MEM_SAFETY_TOLERANCE:-}
+      MEM_BUDGET_FRACTION: ${MEM_BUDGET_FRACTION:-}
+      # Forwarded to spawned recon containers (host network, so localhost).
+      # NOT this service's own connection - see ORCHESTRATOR_NEO4J_URI below.
+      NEO4J_URI: bolt://localhost:7687
+      # The orchestrator's OWN Neo4j connection, used by the clean half of the
+      # TruffleHog dirty/clean split. This process is on the compose network, so
+      # it reaches Neo4j by service name, not localhost.
+      ORCHESTRATOR_NEO4J_URI: ${ORCHESTRATOR_NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set - run redamon.sh (STRIDE S13)}
+      # Agent API for AI hooks in recon (e.g., FFuf AI-extension inference).
+      # Spawned recon containers run on host network, so reach the agent via
+      # its host-mapped port (default 8090) rather than the docker-network name.
+      AGENT_API_URL: http://localhost:${AGENT_PORT:-8090}
+      # GVM connection settings (forwarded to spawned vuln-scanner containers)
+      GVM_SOCKET_PATH: /run/gvmd/gvmd.sock
+      GVM_USERNAME: admin
+      GVM_PASSWORD: ${GVM_PASSWORD:-admin}
+      # On-demand local LLM (Ollama) judge/attacker for the AI Attack Surface
+      # layer. Spawned on scan launch, torn down when the last job finishes;
+      # weights persist in the redamon_llm_models volume. Host network -> the
+      # spawned scan containers reach it at localhost:11434.
+      LOCAL_LLM_IMAGE: ${LOCAL_LLM_IMAGE:-ollama/ollama:latest}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-qwen2.5:7b}
+      LOCAL_LLM_PORT: ${LOCAL_LLM_PORT:-11434}
+      LOCAL_LLM_GPU: ${LOCAL_LLM_GPU:-}
+      # Phase 7: RAM cap on the Ollama judge (was uncapped). Raise for a larger
+      # judge model; set to 0/none to disable (e.g. GPU or a very large model).
+      LOCAL_LLM_MEM: ${LOCAL_LLM_MEM:-8g}
+      # V1 isolation: the on-demand Ollama judge must spawn on the orchestrator's
+      # own (worker-isolated) network so the orchestrator reaches it by DNS.
+      LOCAL_LLM_NETWORK: redamon-orchestrator-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # V1 isolation: orchestrator lives on its own network, NOT on `redamon`, so a
+    # compromised worker cannot reach the privileged orchestration API. Only the
+    # webapp (multi-homed) and the Ollama judge share this network.
+    networks:
+      - orchestrator-net
+
+  kali-sandbox:
+    build:
+      context: ./mcp
+      dockerfile: kali-sandbox/Dockerfile
+      network: host
+    container_name: redamon-kali
+    mem_limit: ${KALI_MEM:-1g}              # sized from host RAM by redamon.sh
+    # D1 owns the Kali sandbox's pids/cpu ceiling (E1 was removed). Very
+    # generous because the interactive terminal runs arbitrary tools that may
+    # spawn many procs; still finite, so a fork bomb via kali_shell is bounded.
+    pids_limit: ${KALI_PIDS:-4096}          # D1: generous fork-bomb ceiling
+    cpus: ${KALI_CPUS:-10}                   # D1: CPU cap (generous)
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    hostname: kali-sandbox
+    cap_add:
+      # NET_RAW: raw sockets for the scanning tools (masscan/nmap SYN, ping).
+      # NET_ADMIN: interface/routing/iptables setup used during exploitation
+      # (tunnels, redirects). SYS_PTRACE is intentionally NOT granted: no tool in
+      # the worker attaches to other processes' memory, and it is a process-snoop
+      # primitive an attacker could abuse.
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      # SECURITY (STRIDE S10/E1/I9): the MCP tool servers, progress streams,
+      # tunnel-manager and ngrok API are consumed ONLY by the agent/webapp over
+      # the internal `redamon` bridge (http://kali-sandbox:PORT) — never from the
+      # host. They are published on 127.0.0.1 for local debugging only, so a
+      # LAN/remote client can no longer reach the unauthenticated tool surface.
+      # The container still binds 0.0.0.0 INSIDE the netns (MCP_HOST below), so
+      # cross-container bridge traffic is unaffected.
+      - "127.0.0.1:${MCP_NETWORK_RECON_PORT:-8000}:8000"
+      - "127.0.0.1:${MCP_NUCLEI_PORT:-8002}:8002"
+      - "127.0.0.1:${MCP_METASPLOIT_PORT:-8003}:8003"
+      - "127.0.0.1:${MCP_NMAP_PORT:-8004}:8004"
+      - "127.0.0.1:${MCP_PLAYWRIGHT_PORT:-8005}:8005"
+      - "127.0.0.1:8013:8013"   # MSF progress stream (agent-internal)
+      - "127.0.0.1:8014:8014"   # Hydra progress stream (agent-internal)
+      # 4444 stays routable on purpose: a compromised target connects BACK to the
+      # operator host:4444 in direct (no-tunnel) reverse-shell mode. Loopback here
+      # would break direct reverse shells. When a tunnel is active it binds
+      # 127.0.0.1:4444 internally and is reached via the tunnel instead.
+      - "4444:4444"
+      - "127.0.0.1:4040:4040"   # ngrok local API (agent-internal)
+      - "127.0.0.1:8015:8015"   # tunnel-manager config (webapp-internal)
+      - "127.0.0.1:8016:8016"   # terminal PTY WS (browser reaches via agent:8090)
+    volumes:
+      # V7: read-only so a compromised worker cannot trojanize its own MCP server
+      # source for restart-surviving persistence. The worker only READS these
+      # files; user MCP plugins live in the DB, not here. Companion changes:
+      # PYTHONDONTWRITEBYTECODE (no __pycache__ writes) + entrypoint cd /tmp (so
+      # relative tool/agent output lands in a writable scratch, not this mount).
+      - ./mcp/servers:/opt/mcp_servers:ro
+      - ./mcp/output:/opt/output
+      - ./mcp/nuclei-templates:/opt/nuclei-templates:ro
+      # Shared tenant_filter.py used by the redagraph CLI
+      - ./graph_db:/opt/graph_db:ro
+      # Shared agent workspace — agent writes tool-outputs / jobs here; kali tools can read
+      - ./agentic/agent-workspace:/workspace
+      # Offline OSV database (supply-chain L3 execute_osv_scanner). Read-only:
+      # populate it with `./redamon.sh supply-chain-sync`, never from here.
+      - osv_db:/osv-db:ro
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /opt:/opt/mcp_servers
+      # execute_osv_scanner reads the offline OSV DB from this path (plan Phase 1).
+      OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY: /osv-db
+      # V7: suppress .pyc writes so the read-only /opt/mcp_servers mount does not
+      # break module imports (Python silently skips bytecode caching).
+      PYTHONDONTWRITEBYTECODE: "1"
+      MCP_TRANSPORT: sse
+      MCP_HOST: 0.0.0.0
+      NETWORK_RECON_PORT: "8000"
+      NUCLEI_PORT: "8002"
+      METASPLOIT_PORT: "8003"
+      NMAP_PORT: "8004"
+      PLAYWRIGHT_PORT: "8005"
+      MSF_PROGRESS_PORT: "8013"
+      HYDRA_PROGRESS_PORT: "8014"
+      MSF_AUTO_UPDATE: "${MSF_AUTO_UPDATE:-true}"
+      NUCLEI_AUTO_UPDATE: "${NUCLEI_AUTO_UPDATE:-true}"
+      TERMINAL_WS_PORT: "8016"
+      # INBOUND auth token the MCP servers validate on every SSE request (STRIDE
+      # S10). This is NOT an outbound secret — it is the credential the worker
+      # CHECKS, so holding it does not violate the "worker holds no secrets" rule.
+      # When empty (dev / not generated) the servers fail-open with a warning.
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:-}"
+      # INBOUND token the tunnel-manager (:8015) validates on config pushes
+      # (STRIDE I19/S14). Same inbound-validation category as MCP_AUTH_TOKEN, so
+      # it does not violate the "worker holds no secrets" rule. Fail-open if unset.
+      TUNNEL_AUTH_TOKEN: "${TUNNEL_AUTH_TOKEN:-}"
+      # Webapp API for fetching tunnel config from Global Settings on boot
+      WEBAPP_API_URL: http://webapp:3000
+      # NOTE: INTERNAL_API_KEY is intentionally NOT passed to the worker. The
+      # worker is the least-trusted, target-facing component and must hold no
+      # secrets (least privilege). No worker process reads this key. Tunnel
+      # config is delivered by the webapp PUSHING to the worker's tunnel-manager
+      # (kali-sandbox:8015): on boot the worker calls the unauthenticated
+      # /api/global/tunnel-config/sync trigger, which makes the webapp push the
+      # saved config. The worker never pulls secrets itself. Do not re-add.
+      # redagraph CLI queries the graph THROUGH THE AGENT (/graph/exec), so the
+      # worker holds NO Neo4j credentials. The agent enforces read-only + tenant
+      # scoping server-side. Do not re-add NEO4J_PASSWORD here: a compromised
+      # worker would otherwise get master read/write access to the whole graph.
+      REDAMON_AGENT_URL: http://agent:8080
+      # S8/I8: /graph/exec now requires internal auth. The worker presents the
+      # SCOPED SCANNER_API_KEY (inbound-validation token, same category as
+      # MCP_AUTH_TOKEN) — NOT the master INTERNAL_API_KEY — so the "worker holds
+      # no master secrets" invariant is preserved. Fail-open if unset (dev).
+      SCANNER_API_KEY: "${SCANNER_API_KEY:-}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.connect(('localhost', 8000)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    networks:
+      redamon:
+      pentest-net:
+
+  agent:
+    build:
+      context: .
+      dockerfile: agentic/Dockerfile
+      args:
+        SKIP_KB: "${SKIP_KB:-false}"
+    container_name: redamon-agent
+    mem_limit: ${AGENT_MEM:-3g}             # sized from host RAM by redamon.sh
+    pids_limit: ${AGENT_PIDS:-1024}         # D1: fork-bomb ceiling (generous)
+    cpus: ${AGENT_CPUS:-8}                   # D1: CPU cap (generous)
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${AGENT_PORT:-8090}:8080"
+    environment:
+      # Neo4j (internal docker network)
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set - run redamon.sh (STRIDE S13)}
+      # WebSocket config
+      WS_HEARTBEAT_INTERVAL: "30"
+      WS_TIMEOUT: "300"
+      WS_MAX_MESSAGE_SIZE: "10485760"
+      # D10: fs_extract zip/tar/gz decompression caps (generous safe defaults).
+      FS_EXTRACT_MAX_ENTRIES: ${FS_EXTRACT_MAX_ENTRIES:-5000}
+      FS_EXTRACT_MAX_TOTAL_BYTES: ${FS_EXTRACT_MAX_TOTAL_BYTES:-524288000}
+      # MCP tool servers (internal docker network)
+      MCP_NETWORK_RECON_URL: http://kali-sandbox:8000/sse
+      MCP_NUCLEI_URL: http://kali-sandbox:8002/sse
+      MCP_NMAP_URL: http://kali-sandbox:8004/sse
+      MCP_METASPLOIT_URL: http://kali-sandbox:8003/sse
+      MCP_PLAYWRIGHT_URL: http://kali-sandbox:8005/sse
+      MCP_METASPLOIT_PROGRESS_URL: http://kali-sandbox:8013/progress
+      MCP_HYDRA_PROGRESS_URL: http://kali-sandbox:8014/progress
+      KALI_TERMINAL_WS_URL: ws://kali-sandbox:8016
+      # Bearer token sent as `Authorization: Bearer` on every MCP SSE request so
+      # the Kali servers can authenticate the agent (STRIDE S10). Must match the
+      # kali-sandbox MCP_AUTH_TOKEN. Empty in dev → no header, servers fail-open.
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:-}"
+      # Secret used to verify short-lived agent-WebSocket tickets on the /ws/agent
+      # init frame (STRIDE S6). Must match the webapp's AGENT_WS_TICKET_SECRET.
+      # Empty in dev → agent fails open (accepts init without a ticket).
+      AGENT_WS_TICKET_SECRET: "${AGENT_WS_TICKET_SECRET:-}"
+      # Webapp API (internal docker network)
+      WEBAPP_API_URL: http://webapp:3000
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-changeme}
+      SCANNER_API_KEY: ${SCANNER_API_KEY:-changeme}  # S3/E6 scoped scanner token
+      # Knowledge Base
+      KB_ENABLED: "${KB_ENABLED:-false}"
+      KB_PATH: /app/knowledge_base/data
+      # Fireteam requires AsyncPostgresSaver for safe mid-wave checkpointing.
+      PERSISTENT_CHECKPOINTER: "true"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-redamon}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set - run redamon.sh (STRIDE S13)}@postgres:5432/${POSTGRES_DB:-redamon}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./agentic/logs:/app/logs
+      - ./agentic/skills:/app/skills:ro
+      - ./agentic/community-skills:/app/community-skills:ro
+      - cypherfix-repos:/tmp/cypherfix-repos
+      # CodeFix working trees: the agent clones here; the orchestrator bind-mounts
+      # each per-job worktree into an isolated build sandbox (T6/E10).
+      - cypherfix-work:/app/codefix-work
+      - ./services/knowledge_base/kb_config.yaml:/app/knowledge_base/kb_config.yaml:ro
+      - ./services/knowledge_base/data:/app/knowledge_base/data
+      - tradecraft_cache:/app/tradecraft_cache
+      # Per-project workspace — fs_* tools, output offloading, background jobs
+      - ./agentic/agent-workspace:/workspace
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      kali-sandbox:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 60s
+      timeout: 60s
+      retries: 3
+      start_period: 30s
+    networks:
+      - redamon
+
+  # ===========================================================================
+  # Knowledge Base Refresh Sidecar
+  # ===========================================================================
+  # Opt-in scheduled refresh for KB data sources. Reuses the agent image so we
+  # don't have to rebuild anything separately. Shares the kb_data volume with
+  # the agent so updates are immediately visible without restarting the agent.
+  #
+  # Schedule:
+  #   - Daily 03:00 UTC: NVD incremental update (~60 new CVEs/day)
+  #   - Mondays 04:00 UTC: ExploitDB + Nuclei templates
+  #   - 1st of month 05:00 UTC: GTFOBins + LOLBAS
+  #
+  # Enable with:
+  #   KB_REFRESH_ENABLED=true docker compose --profile kb-refresh up -d kb-refresh
+  #
+  # Or via redamon.sh once that integration lands. Default is OFF — users opt in.
+  # ===========================================================================
+
+  kb-refresh:
+    profiles: ["kb-refresh"]
+    build:
+      context: .
+      dockerfile: agentic/Dockerfile
+    image: redamon-agent
+    container_name: redamon-kb-refresh
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set - run redamon.sh (STRIDE S13)}
+      KB_PATH: /app/knowledge_base/data
+      NVD_API_KEY: "${NVD_API_KEY:-}"
+    volumes:
+      - ./services/knowledge_base/kb_config.yaml:/app/knowledge_base/kb_config.yaml:ro
+      - kb_data:/app/knowledge_base/data
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: ${KB_REFRESH_MEM:-4g}        # sized from host RAM by redamon.sh (kb profile)
+    pids_limit: ${KB_REFRESH_PIDS:-512}
+    cap_drop:
+      - ALL
+    networks:
+      - redamon
+    # Sleep loop scheduler — runs source updates on cadence.
+    # Production setups should replace this with a real cron container or
+    # external scheduler (host cron, systemd timer, GitHub Actions).
+    command: >
+      sh -c '
+      echo "[KB-REFRESH] sidecar started at $$(date -u +%Y-%m-%dT%H:%M:%SZ)";
+      while true; do
+        DAY_OF_WEEK=$$(date -u +%u);
+        DAY_OF_MONTH=$$(date -u +%d);
+        HOUR=$$(date -u +%H);
+
+        echo "[KB-REFRESH $$(date -u +%Y-%m-%dT%H:%M:%SZ)] daily NVD refresh";
+        python -m knowledge_base.curation.data_ingestion \
+          --source nvd \
+          --neo4j-uri bolt://neo4j:7687 \
+          --neo4j-user neo4j \
+          --neo4j-password $$NEO4J_PASSWORD \
+          $${NVD_API_KEY:+--nvd-key $$NVD_API_KEY} \
+          || echo "[KB-REFRESH] NVD refresh failed";
+
+        if [ "$$DAY_OF_WEEK" = "1" ]; then
+          echo "[KB-REFRESH $$(date -u +%Y-%m-%dT%H:%M:%SZ)] weekly ExploitDB + Nuclei refresh";
+          python -m knowledge_base.curation.data_ingestion --source exploitdb \
+            --neo4j-uri bolt://neo4j:7687 --neo4j-user neo4j --neo4j-password $$NEO4J_PASSWORD \
+            || echo "[KB-REFRESH] ExploitDB refresh failed";
+          python -m knowledge_base.curation.data_ingestion --source nuclei \
+            --neo4j-uri bolt://neo4j:7687 --neo4j-user neo4j --neo4j-password $$NEO4J_PASSWORD \
+            || echo "[KB-REFRESH] Nuclei refresh failed";
+        fi;
+
+        if [ "$$DAY_OF_MONTH" = "01" ]; then
+          echo "[KB-REFRESH $$(date -u +%Y-%m-%dT%H:%M:%SZ)] monthly GTFOBins + LOLBAS refresh";
+          python -m knowledge_base.curation.data_ingestion --source gtfobins \
+            --neo4j-uri bolt://neo4j:7687 --neo4j-user neo4j --neo4j-password $$NEO4J_PASSWORD \
+            || echo "[KB-REFRESH] GTFOBins refresh failed";
+          python -m knowledge_base.curation.data_ingestion --source lolbas \
+            --neo4j-uri bolt://neo4j:7687 --neo4j-user neo4j --neo4j-password $$NEO4J_PASSWORD \
+            || echo "[KB-REFRESH] LOLBAS refresh failed";
+        fi;
+
+        echo "[KB-REFRESH $$(date -u +%Y-%m-%dT%H:%M:%SZ)] sleeping 24h until next refresh";
+        sleep 86400;
+      done
+      '
+
+  # ===========================================================================
+  # Frontend
+  # ===========================================================================
+
+  webapp:
+    build:
+      context: ./webapp
+      args:
+        REDAMON_VERSION: "${REDAMON_VERSION:-0.0.0}"
+    container_name: redamon-webapp
+    mem_limit: ${WEBAPP_MEM:-1g}            # sized from host RAM by redamon.sh
+    pids_limit: ${WEBAPP_PIDS:-512}         # D1: fork-bomb ceiling (generous)
+    cpus: ${WEBAPP_CPUS:-4}                  # D1: CPU cap (generous)
+    ports:
+      - "${WEBAPP_PORT:-3000}:3000"
+    environment:
+      # PostgreSQL (Prisma)
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-redamon}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set - run redamon.sh (STRIDE S13)}@postgres:5432/${POSTGRES_DB:-redamon}"
+      # HTTP traffic capture: body full-text search (Phase 3). Off by default —
+      # the GIN-over-bodies index is sizable vs the 1g Postgres cap (§6.3/§15.8).
+      # Applied idempotently by the entrypoint after `db push`; drops when off.
+      CAPTURE_PROXY_FTS: ${CAPTURE_PROXY_FTS:-false}
+      # HTTP traffic capture: the ingest worker's scoped DSN. Passed to the webapp
+      # ONLY so the entrypoint (scripts/apply-ingest-role.mjs) can provision the
+      # matching INSERT-only `traffic_ingest` Postgres role and keep its password in
+      # sync. Generated by redamon.sh; without the role the ingest can't write.
+      TRAFFIC_INGEST_DATABASE_URL: ${TRAFFIC_INGEST_DATABASE_URL:-}
+      # Neo4j (server-side graph queries)
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set - run redamon.sh (STRIDE S13)}
+      # Ceiling on a single Cypher query. The driver's connection timeouts only
+      # bound ACQUIRING a connection, so without this a whole-graph read on a very
+      # large project leaves the request pending forever and pins a pooled
+      # connection. Blank -> the code default (120s); no .env edit required.
+      NEO4J_QUERY_TIMEOUT_MS: ${NEO4J_QUERY_TIMEOUT_MS:-}
+      # Auth
+      AUTH_SECRET: ${AUTH_SECRET:-changeme}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-changeme}
+      SCANNER_API_KEY: ${SCANNER_API_KEY:-changeme}  # S3/E6 scoped scanner token
+      # S2/E2: flip the internal-key route allowlist from log-only to enforce.
+      # Default false = fail-open rollout (the shipped behavior); set true in
+      # .env once logs confirm only known routes use the key. Wired here so it is
+      # reachable via .env (webapp has no env_file).
+      INTERNAL_KEY_ALLOWLIST_ENFORCE: ${INTERNAL_KEY_ALLOWLIST_ENFORCE:-false}
+      # Scan Timeline (versioned recon graphs). All pass through EMPTY so unset
+      # keeps the safe code defaults in webapp/src/lib/scan*.ts. Wired here for the
+      # same reason as the knob above: the webapp has NO env_file, so a value set
+      # only in .env would be silently inert (see CHANGELOG 6.2.7 for the same
+      # class of bug on the orchestrator).
+      SCAN_SNAPSHOT_MAX_BYTES: ${SCAN_SNAPSHOT_MAX_BYTES:-}
+      SCAN_SNAPSHOT_MAX_CONCURRENCY: ${SCAN_SNAPSHOT_MAX_CONCURRENCY:-}
+      SCAN_VERSION_RETENTION_KEEP: ${SCAN_VERSION_RETENTION_KEEP:-}
+      SCAN_JOB_FAILED_RETENTION_DAYS: ${SCAN_JOB_FAILED_RETENTION_DAYS:-}
+      ACTIVATION_LOCK_TTL_MS: ${ACTIVATION_LOCK_TTL_MS:-}
+      SCAN_SCHEDULE_MIN_INTERVAL_MINUTES: ${SCAN_SCHEDULE_MIN_INTERVAL_MINUTES:-}
+      SCAN_SCHEDULE_ASSUMED_RUN_MINUTES: ${SCAN_SCHEDULE_ASSUMED_RUN_MINUTES:-}
+      # Global row cap for every RedZone analytics query (was a per-route LIMIT
+      # of 200/500/1000/2000). Passed through EMPTY so unset keeps the 200k code
+      # default in webapp/src/app/api/analytics/redzone/rowCap.ts. Lower it on a
+      # memory-tight host: the Neo4j driver buffers a whole result set before the
+      # route maps it, inside this service's 1g mem_limit. Wired here because the
+      # webapp has NO env_file, so a value set only in .env would be inert.
+      REDAMON_REDZONE_ROW_CAP: ${REDAMON_REDZONE_ROW_CAP:-}
+      # A1 (supply-chain incident match) on the TypeScript ingest path. Same
+      # env_file caveat as every knob above: the webapp has NO env_file.
+      SCA_INTEL_PATH: /sca-intel
+      SCA_INTEL_MATCH_ENABLED: ${SCA_INTEL_MATCH_ENABLED:-true}
+      CAPTURE_IOC_IGNORE_SUFFIXES: ${CAPTURE_IOC_IGNORE_SUFFIXES:-}
+      # S11: login lockout / backoff thresholds. SAFE DEFAULTS so an unset value
+      # fails safe to a real limit, never to "no limit".
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+      LOGIN_LOCKOUT_SECONDS: ${LOGIN_LOCKOUT_SECONDS:-900}
+      # R5: mark X-Forwarded-For trustworthy only behind a proxy (public posture
+      # with nginx). Default false = local posture treats the IP as best-effort.
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      # Signs short-lived agent-WebSocket tickets the agent verifies (STRIDE S6).
+      # Dedicated secret (NOT AUTH_SECRET) so agent-side exposure can't forge
+      # login cookies. Empty in dev → no ticket minted, agent fails open.
+      AGENT_WS_TICKET_SECRET: "${AGENT_WS_TICKET_SECRET:-}"
+      # Bearer token the webapp presents when pushing tunnel config to the
+      # worker's tunnel-manager :8015 (STRIDE I19/S14). Empty in dev → no header.
+      TUNNEL_AUTH_TOKEN: "${TUNNEL_AUTH_TOKEN:-}"
+      # Backend services (server-side API routes → internal docker network)
+      RECON_ORCHESTRATOR_URL: http://recon-orchestrator:8010
+      # Sent as X-Orchestrator-Key on every orchestrator call (server-side only).
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:-changeme}
+      AGENT_API_URL: http://agent:8080
+      AGENT_WS_URL: ws://agent:8080/ws/agent
+      # Browser -> agent WebSocket routing (issue #159). This default deploy has NO
+      # reverse proxy, so tell the UI to dial the agent's PUBLISHED port on whatever
+      # host the browser used -> LAN/remote access ("http://<host>:3000") connects the
+      # Terminal + AI Agent with no config. Read at request time by app/layout.tsx, so
+      # changing it is edit-.env + `docker compose up -d webapp` (no rebuild).
+      # Behind a reverse proxy instead, set AGENT_WS_PUBLIC_URL=wss://<host>/ws/agent
+      # (or unset AGENT_WS_MODE) to keep same-origin routing.
+      AGENT_WS_MODE: "${AGENT_WS_MODE:-agent-port}"
+      AGENT_WS_PORT: "${AGENT_PORT:-8090}"
+      AGENT_WS_PUBLIC_URL: "${AGENT_WS_PUBLIC_URL:-}"
+      # Recon container connects via host network, needs host-accessible webapp URL
+      WEBAPP_URL: http://localhost:${WEBAPP_PORT:-3000}
+      # Output paths (must match volume mounts below)
+      RECON_OUTPUT_PATH: /data/recon-output
+      GVM_OUTPUT_PATH: /data/gvm-output
+      GITHUB_HUNT_OUTPUT_PATH: /data/github-hunt-output
+      TRUFFLEHOG_OUTPUT_PATH: /data/trufflehog-output
+      SUPPLY_CHAIN_OUTPUT_PATH: /data/supply-chain-output
+      REPORT_OUTPUT_PATH: /data/reports
+      WORDLIST_UPLOAD_PATH: /data/recon-wordlists
+      NUCLEI_TEMPLATES_PATH: /data/nuclei-templates
+    volumes:
+      - ./recon/output:/data/recon-output:ro
+      - ./recon/wordlists:/data/recon-wordlists:rw
+      - ./mcp/nuclei-templates:/data/nuclei-templates:rw
+      - ./scanners/gvm_scan/output:/data/gvm-output:ro
+      - ./scanners/github_secret_hunt/output:/data/github-hunt-output:ro
+      - ./scanners/trufflehog_scan/output:/data/trufflehog-output:ro
+      # L1 Supply-Chain scan result JSON (supply_chain_<projectId>.json), served
+      # read-only by /api/supply-chain/[projectId]/download.
+      - ./scanners/supply_chain_scan/output:/data/supply-chain-output:ro
+      # AI Attack Surface native reports (garak/pyrit/giskard/promptfoo) for the
+      # transcript drill-down (§9c). Read-only; served via a path-validated route.
+      - ./scanners/ai_attack_surface_scan/output:/data/ai-attack-output:ro
+      # A1: the webapp is the SECOND writer of captured_http_transactions (the
+      # direct recon/agent ingest route), so it needs the same incident catalog
+      # the Python spool worker reads, or only half the captured traffic would
+      # ever be flagged. Read-only.
+      - sca_intel:/sca-intel:ro
+      - report_data:/data/reports
+      - js_recon_uploads:/data/js-recon-uploads
+      # Supply-chain SBOM/lockfile uploads: webapp writes, the scan reads (ro).
+      - supply_chain_uploads:/data/supply-chain-uploads
+      - js_recon_custom:/data/js-recon-custom
+      - ./VERSION:/app/VERSION:ro
+      # HTTP traffic capture (Phase 1): read offloaded bodies for the /traffic
+      # detail view + ref-counted body GC on delete/retention. rw for the GC.
+      - capture_bodies:/capture-bodies
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Multi-homed: `redamon` for the worker/agent/db, `orchestrator-net` so the
+    # webapp (the only legitimate caller) can still reach the isolated orchestrator.
+    networks:
+      - redamon
+      - orchestrator-net
+
+  # ===========================================================================
+  # HTTP Traffic Capture (mitmproxy) — Phase 1. Both services build from
+  # capture_proxy/Dockerfile. Gated behind the `capture` profile so a plain
+  # `docker compose up` does NOT start them; the recon orchestrator manages the
+  # proxy lifecycle from the per-project toggle (§8.4). Build with:
+  #   docker compose --profile capture build capture-proxy
+  # Apply the scoped role once (scanners/capture_proxy/sql/001_traffic_ingest_role.sql).
+  # ===========================================================================
+  capture-proxy:
+    profiles: ["capture"]
+    build:
+      context: .
+      dockerfile: scanners/capture_proxy/Dockerfile
+    image: redamon-capture-proxy:latest
+    container_name: redamon-capture-proxy
+    # confdir=/ca keeps the mitmproxy CA (a forge-anything key, §15.9) on a
+    # restricted volume readable only by this container; the private key never
+    # leaves it. stream_large_bodies bounds memory on huge responses.
+    command: ["mitmdump","--quiet","--set","confdir=/ca","--set","connection_strategy=lazy","--set","stream_large_bodies=5m","--listen-port","8888","-s","/app/capture_addon.py"]
+    environment:
+      CAPTURE_SPOOL_DIR: /spool
+      CAPTURE_BODIES_DIR: /bodies
+      # The egress-guard + body-storage policy are NO LONGER env-configured here.
+      # They are the single source of truth in the DB (Global Settings > TrafficMind),
+      # materialised to /spool/.capture-config.json by the orchestrator's reconciler
+      # and HOT-RELOADED by the proxy. Until that file first appears, the proxy fails
+      # CLOSED (every egress class blocked) — a stale/compose env can no longer drift
+      # the running policy.
+      #
+      # Extra RedAmon service IPs the proxy must never reach: a SECURITY invariant,
+      # NOT a DB-tunable knob (never gated by the egress toggles), so it stays on the
+      # env and is always enforced.
+      CAPTURE_BLOCKED_IPS: "${CAPTURE_BLOCKED_IPS:-}"
+    # Target-facing plane ONLY. No redamon-network -> structurally cannot reach
+    # Postgres/Neo4j/agent/webapp/orchestrator. Holds NO DB creds, NO signing key.
+    networks:
+      - pentest-net
+    ports:
+      # Loopback publish so host-net recon containers reach it at 127.0.0.1:<port>.
+      - "127.0.0.1:${CAPTURE_PROXY_PORT:-8888}:8888"
+    volumes:
+      - capture_spool:/spool
+      - capture_bodies:/bodies
+      - capture_ca:/ca
+    # §15.10: non-root image user, no caps, no privesc, read-only root fs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    # NOTE: no `no-new-privileges` here — it breaks execve on this project's
+    # Docker/AppArmor hosts (see container_manager.py). setuid/setgid bits are
+    # stripped in the image instead (capture_proxy/Dockerfile).
+    mem_limit: ${CAPTURE_PROXY_MEM:-384m}   # sized from host RAM by redamon.sh
+    pids_limit: 256
+    restart: "no"
+
+  traffic-ingest:
+    profiles: ["capture"]
+    build:
+      context: .
+      dockerfile: scanners/capture_proxy/Dockerfile
+    image: redamon-capture-proxy:latest
+    container_name: redamon-traffic-ingest
+    command: ["python","/app/ingest_worker.py"]
+    environment:
+      CAPTURE_SPOOL_DIR: /spool
+      CAPTURE_BODIES_DIR: /bodies
+      CAPTURE_PROXY_REDACT_SECRETS: "${CAPTURE_PROXY_REDACT_SECRETS:-true}"
+      CAPTURE_REDACT_SALT: "${CAPTURE_REDACT_SALT:-redamon-capture}"
+      # Scoped INSERT-only role (scanners/capture_proxy/sql/001_traffic_ingest_role.sql).
+      TRAFFIC_INGEST_DATABASE_URL: "${TRAFFIC_INGEST_DATABASE_URL:-postgresql://traffic_ingest:changeme@postgres:5432/${POSTGRES_DB:-redamon}}"
+      # Tag-verification keys: source=recon -> SCANNER_API_KEY, source=agent -> INTERNAL_API_KEY.
+      SCANNER_API_KEY: "${SCANNER_API_KEY:-}"
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
+      # A1 (supply-chain incident match). PYTHONPATH so the bind-mounted
+      # supply_chain_common is importable; the ignore list suppresses the
+      # operator's own OAST callbacks; the kill switch is deliberately not in
+      # the UI.
+      PYTHONPATH: "/app"
+      SCA_INTEL_PATH: /sca-intel
+      SCA_INTEL_MATCH_ENABLED: "${SCA_INTEL_MATCH_ENABLED:-true}"
+      CAPTURE_IOC_IGNORE_SUFFIXES: "${CAPTURE_IOC_IGNORE_SUFFIXES:-}"
+    # Trusted plane: needs Postgres. NO pentest-net -> no target egress at all.
+    networks:
+      - redamon
+    volumes:
+      - capture_spool:/spool
+      - capture_bodies:/bodies
+      # A1: incident catalog, READ-ONLY. This worker is the one that flags a
+      # captured request to a known-bad host. It is a set lookup: no network, no
+      # extra credential, and the INSERT-only Postgres role is unchanged.
+      - sca_intel:/sca-intel:ro
+      # supply_chain_common is NOT baked into this image (only the capture files
+      # are COPYed), and the matcher lives there. Without this mount the lookup
+      # degrades to "no match" on every request, which is indistinguishable from
+      # a clean run.
+      - ./scanners/supply_chain_common:/app/supply_chain_common:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    # NOTE: no `no-new-privileges` here — it breaks execve on this project's
+    # Docker/AppArmor hosts (see container_manager.py). setuid/setgid bits are
+    # stripped in the image instead (capture_proxy/Dockerfile).
+    mem_limit: ${TRAFFIC_INGEST_MEM:-256m}  # sized from host RAM by redamon.sh
+    pids_limit: 256
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+# =============================================================================
+# Networks
+# =============================================================================
+
+networks:
+  redamon:
+    name: redamon-network
+    driver: bridge
+  # V1 isolation: dedicated network for the privileged orchestrator. Explicit
+  # name so LOCAL_LLM_NETWORK (orchestrator env) matches the spawned Ollama's net.
+  # The worker (kali-sandbox) is NOT on this network and so cannot reach :8010.
+  orchestrator-net:
+    name: redamon-orchestrator-net
+    driver: bridge
+    # Explicit subnet so Docker never auto-assigns this net the same /16 that
+    # pentest-net reserves below. Without it, orchestrator-net (created first)
+    # grabs the next free /16 — which can land on 172.28 and collide.
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+  pentest-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+  # CodeFix build sandboxes attach here at spawn. Deliberately a plain bridge with
+  # NAT egress (builds fetch npm/pip deps) but NO RedAmon service joins it, so a
+  # malicious build has internet but cannot reach webapp/neo4j/postgres/agent.
+  # Because no service is attached, Compose never creates it — the recon
+  # orchestrator creates it on demand (`_ensure_codefix_network`) with an
+  # auto-assigned subnet. This declaration documents intent and keeps
+  # `docker compose config` aware of it.
+  codefix-net:
+    name: redamon-codefix-net
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  report_data:
+  js_recon_uploads:
+  js_recon_custom:
+  neo4j_logs:
+  neo4j_import:
+  neo4j_plugins:
+  kb_data:
+    name: redamon_kb_data
+  tradecraft_cache:
+    name: redamon_tradecraft_cache
+  # On-demand local LLM (Ollama) model weights for the AI Attack Surface layer.
+  # The container is spawned/torn down per scan; this volume persists the pulled
+  # judge/attacker models so restarts reload from RAM, not a re-download.
+  # Name must match LLM_MODELS_VOLUME in recon_orchestrator/local_llm_manager.py.
+  llm_models:
+    name: redamon_llm_models
+  # GVM volumes (names must match container_manager.py references)
+  vt_data:
+    name: redamon_vt_data
+  notus_data:
+    name: redamon_notus_data
+  scap_data:
+    name: redamon_scap_data
+  cert_data:
+    name: redamon_cert_data
+  data_objects:
+    name: redamon_data_objects
+  gpg_data:
+    name: redamon_gpg_data
+  gvm_redis_socket:
+    name: redamon_gvm_redis_socket
+  gvm_psql_data:
+    name: redamon_gvm_psql_data
+  gvm_psql_socket:
+    name: redamon_gvm_psql_socket
+  gvmd_data:
+    name: redamon_gvmd_data
+  gvmd_socket:
+    name: redamon_gvmd_socket
+  ospd_socket:
+    name: redamon_ospd_socket
+  cypherfix-repos:  # Temp storage for cloned GitHub repos (CodeFix agent)
+  # Shared between the agent (clones here) and the orchestrator (bind-mounts the
+  # per-job worktree into the build sandbox). NOT shared with scanners (unlike
+  # /tmp/redamon), so a low-trust scanner cannot tamper with a repo before its PR.
+  cypherfix-work:
+    name: redamon_cypherfix_work
+  redamon_broker_socket:  # Holds the docker-broker filtered socket; in-VM so it is shareable on macOS + Linux
+    name: redamon_broker_socket
+  # HTTP traffic capture (Phase 1): the append-only spool (proxy writes, ingest
+  # drains), the content-addressed body store (deduped blobs), and the proxy's
+  # restricted mitmproxy CA dir (private key never leaves the proxy, §15.9).
+  capture_spool:
+    name: redamon_capture_spool
+  capture_bodies:
+    name: redamon_capture_bodies
+  capture_ca:
+    name: redamon_capture_ca
+  # Offline OSV vulnerability + malicious-package database (supply-chain feature).
+  # Populated lazily per-ecosystem by `redamon.sh supply-chain-sync` (osv-scanner
+  # --download-offline-databases from the official GCS bucket); NOT downloaded at
+  # install time. Mounted read-only into every supply-chain scan container and
+  # into the dirty analyzer; the sync step is the only writer. The name is
+  # referenced by the docker-broker volume allowlist and container_manager.py.
+  osv_db:
+    name: redamon-osv-db
+  # Supply-chain incident intel derived from the supplychainattack.org catalog
+  # (attacker domains, bad package names, typosquat pairs + a manifest recording
+  # the feed revision). Populated by `redamon.sh sca-intel-sync` and refreshed
+  # TTL-guarded on the scan-spawn path by the orchestrator. Mounted READ-ONLY
+  # everywhere; the sync sidecar is the only writer, and it is deliberately NOT
+  # on the broker's ALLOWED_RW_VOLUMES so a spawned scanner cannot poison it.
+  sca_intel:
+    name: redamon-sca-intel
+  # Operator-uploaded SBOMs/lockfiles for L1 supply-chain scans. Shared between
+  # the webapp (writes) and the spawned scan container (reads, read-only).
+  supply_chain_uploads:
+    name: redamon_supply_chain_uploads

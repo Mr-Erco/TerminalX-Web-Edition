@@ -1,3 +1,5 @@
+
+
 A lightweight browser tool that lets you run custom scripts, automate websites, and interact with pages using a clean Terminal X–styled interface. This extension is inspired by userscript managers like Tampermonkey but redesigned with a modern, minimal Terminal X UI.
 
 ⭐ Features Run custom scripts on any website
